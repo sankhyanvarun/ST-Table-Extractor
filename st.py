@@ -12,12 +12,11 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 # ─── Configuration ────────────────────────────────────────────────────────────
-script_dir = os.path.dirname(os.path.abspath(__file__))
+script_dir = os.path.dirname(os.path.abspath(__file__)) if "__file__" in locals() else os.getcwd()
 POPPLER_PATH = os.path.join(script_dir, "poppler", "bin")
-TESSERACT_CMD = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+TESSERACT_CMD = r"C:\Program Files\Tesseract-OCR\tesseract.exe" if os.name == 'nt' else "/usr/bin/tesseract"
 pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
 
-# ─── Helper Functions ──────────────────────────────────────────────────────────
 
 def get_poppler_path():
     return POPPLER_PATH
@@ -155,6 +154,7 @@ def parse_toc(text, is_hindi=False):
 
     return entries
 
+
 # ─── Streamlit UI ──────────────────────────────────────────────────────────────
 
 st.set_page_config(page_title="PDF TOC Extractor", layout="wide")
@@ -172,180 +172,136 @@ if 'pdf_name' not in st.session_state:
 if 'raw_pdf_bytes' not in st.session_state:
     st.session_state.raw_pdf_bytes = None
 
-with st.expander("ℹ️ How to use", expanded=True):
-    st.write("""
-    1. **Upload PDF** - Upload any PDF document
-    2. **Extract TOC** - Click the button to extract the Table of Contents
-    3. **View TOC** - Review the extracted table
-    4. **Edit TOC** - Click the edit button to make changes
-    5. **Save Changes** - Save your edits when done
-    6. **Download** - Export the final TOC as a CSV file
-    """)
+# Main workflow logic
+def main():
+    with st.expander("ℹ️ How to use", expanded=True):
+        st.write("""
+        1. **Upload PDF** - Upload any PDF document
+        2. **Extract TOC** - Click the button to extract the Table of Contents
+        3. **View TOC** - Review the extracted table
+        4. **Edit TOC** - Click the edit button to make changes
+        5. **Save Changes** - Save your edits when done
+        6. **Download** - Export the final TOC as a CSV file
+        """)
 
-# ─── Step 1: File Upload ──────────────────────────────────────────────────────
+    # ─── Step 1: File Upload ──────────────────────────────────────────────────
+    st.subheader("1. Upload PDF")
+    uploaded_file = st.file_uploader("Choose a PDF file", type=["pdf"], label_visibility="collapsed")
 
-st.subheader("1. Upload PDF")
-uploaded_file = st.file_uploader("Choose a PDF file", type=["pdf"], label_visibility="collapsed")
+    if uploaded_file and st.session_state.raw_pdf_bytes is None:
+        pdf_bytes = uploaded_file.read()
+        st.session_state.raw_pdf_bytes = pdf_bytes
+        st.session_state.pdf_name = uploaded_file.name
+        st.session_state.extracted = False  # Reset extraction state on new upload
+        st.success("PDF uploaded successfully!")
 
-if uploaded_file and st.session_state.raw_pdf_bytes is None:
-    # Save PDF bytes in session state
-    pdf_bytes = uploaded_file.read()
-    st.session_state.raw_pdf_bytes = pdf_bytes
-    st.session_state.pdf_name = uploaded_file.name
-    st.success("PDF uploaded successfully!")
-
-# ─── Step 2: Extract TOC ─────────────────────────────────────────────────────
-
-if st.session_state.raw_pdf_bytes and not st.session_state.extracted:
-    st.subheader("2. Extract Table of Contents")
-    
-    with st.form("extract_form"):
-        language = st.selectbox("OCR Language", ("eng", "hin", "both"), index=0)
-        extract_btn = st.form_submit_button("🔍 Extract TOC")
+    # ─── Step 2: Extract TOC ─────────────────────────────────────────────────
+    if st.session_state.raw_pdf_bytes and not st.session_state.extracted:
+        st.subheader("2. Extract Table of Contents")
         
-        if extract_btn:
-            with st.spinner("Extracting TOC..."):
-                with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-                    tmp.write(st.session_state.raw_pdf_bytes)
-                    tmp_path = tmp.name
-                
-                is_hindi = (language == "hin" or language == "both")
-                ocr_lang = "eng+hin" if language == "both" else language
-                
-                try:
-                    # Find and extract TOC pages
-                    toc_indices = find_toc_page_indices(tmp_path)
+        with st.form("extract_form"):
+            language = st.selectbox("OCR Language", ("eng", "hin", "both"), index=0)
+            if st.form_submit_button("🔍 Extract TOC"):
+                with st.spinner("Extracting TOC..."):
+                    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+                        tmp.write(st.session_state.raw_pdf_bytes)
+                        tmp_path = tmp.name
                     
-                    if toc_indices:
-                        st.info(f"Found TOC at pages: {[i+1 for i in toc_indices]}")
-                        raw_text = extract_text_from_pages(tmp_path, toc_indices, lang=ocr_lang)
-                    else:
-                        st.warning("No TOC pages detected. Processing entire document...")
-                        raw_text = extract_text_from_pdf(tmp_path, lang=ocr_lang)
+                    is_hindi = (language == "hin" or language == "both")
+                    ocr_lang = "eng+hin" if language == "both" else language
                     
-                    # Parse TOC entries
-                    toc_entries = parse_toc(raw_text, is_hindi=is_hindi)
-                    
-                    if not toc_entries:
-                        st.warning("No TOC entries detected. Try selecting a different OCR language.")
-                    else:
-                        df = pd.DataFrame(toc_entries)
-                        st.session_state.df = df
-                        st.session_state.extracted = True
-                        st.success(f"Extracted {len(toc_entries)} TOC entries")
-                
-                except Exception as e:
-                    st.error(f"Extraction error: {str(e)}")
-                
-                finally:
-                    if os.path.exists(tmp_path):
-                        os.remove(tmp_path)
+                    try:
+                        toc_indices = find_toc_page_indices(tmp_path)
+                        if toc_indices:
+                            raw_text = extract_text_from_pages(tmp_path, toc_indices, lang=ocr_lang)
+                        else:
+                            raw_text = extract_text_from_pdf(tmp_path, lang=ocr_lang)
+                        
+                        toc_entries = parse_toc(raw_text, is_hindi=is_hindi)
+                        
+                        if toc_entries:
+                            st.session_state.df = pd.DataFrame(toc_entries)
+                            st.session_state.extracted = True
+                            st.success(f"Extracted {len(toc_entries)} TOC entries")
+                        else:
+                            st.warning("No TOC entries detected.")
+                    except Exception as e:
+                        st.error(f"Extraction error: {str(e)}")
+                    finally:
+                        if os.path.exists(tmp_path):
+                            os.remove(tmp_path)
 
-# ─── Step 3: View TOC ────────────────────────────────────────────────────────
-
-if st.session_state.extracted and st.session_state.df is not None:
-    st.subheader("3. Extracted Table of Contents")
-    
-    # Display the table in read-only mode
-    st.dataframe(st.session_state.df, use_container_width=True, height=400)
-    
-    # Edit button
-    if st.button("✏️ Edit TOC", use_container_width=True):
-        st.session_state.editing = True
-        st.experimental_rerun()
-
-# ─── Step 4: Edit Mode ────────────────────────────────────────────────────────
-
-if st.session_state.editing and st.session_state.df is not None:
-    st.subheader("4. Edit Table of Contents")
-    
-    # Display editable table
-    edited_df = st.data_editor(
-        st.session_state.df,
-        key="toc_editor",
-        num_rows="dynamic",
-        use_container_width=True,
-        height=400
-    )
-    
-    # Save Changes button
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("💾 Save Changes", use_container_width=True, type="primary"):
-            st.session_state.df = edited_df
-            st.session_state.editing = False
-            st.success("Changes saved successfully!")
-            st.experimental_rerun()
-    
-    with col2:
-        if st.button("❌ Cancel Editing", use_container_width=True):
-            st.session_state.editing = False
-            st.experimental_rerun()
-
-# ─── Step 5/6: Download CSV ──────────────────────────────────────────────────
-
-if st.session_state.extracted and st.session_state.df is not None:
-    st.subheader("5. Download Results")
-    
-    # Generate filename
-    if st.session_state.pdf_name:
-        base_name = os.path.splitext(st.session_state.pdf_name)[0]
-        csv_name = f"{base_name}_TOC.csv"
-    else:
-        csv_name = "table_of_contents.csv"
-    
-    # Create CSV data
-    csv_data = st.session_state.df.to_csv(index=False).encode("utf-8")
-    
-    # Download button
-    st.download_button(
-        label="💾 Download as CSV",
-        data=csv_data,
-        file_name=csv_name,
-        mime="text/csv",
-        use_container_width=True,
-        type="primary"
-    )
-
-# ─── PDF Preview Section (Always available after upload) ─────────────────────
-
-if st.session_state.raw_pdf_bytes:
-    st.divider()
-    st.subheader("PDF Preview")
-    
-    # Download button for PDF
-    st.download_button(
-        label="⬇️ Download Original PDF",
-        data=st.session_state.raw_pdf_bytes,
-        file_name=st.session_state.pdf_name,
-        mime="application/pdf",
-        use_container_width=True
-    )
-    
-    # PDF preview using Google Docs Viewer
-    try:
-        # Create a temporary file for PDF preview
-        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-            tmp.write(st.session_state.raw_pdf_bytes)
-            tmp_path = tmp.name
+    # ─── Step 3: View TOC ────────────────────────────────────────────────────
+    if st.session_state.extracted and st.session_state.df is not None:
+        st.subheader("3. Extracted Table of Contents")
+        st.dataframe(st.session_state.df, use_container_width=True, height=400)
         
-        # Use Google Docs Viewer for reliable preview
-        pdf_display = f"""
-        <iframe
-            src="https://docs.google.com/gview?url={tmp_path}&embedded=true"
-            width="100%"
-            height="600px"
-            style="border: 1px solid #eee; border-radius: 8px;"
-            frameborder="0"
-        ></iframe>
-        """
-        components.html(pdf_display, height=600)
-    except Exception as e:
-        st.warning(f"Preview failed: {str(e)}. Please download the PDF to view it.")
+        if st.button("✏️ Edit TOC", use_container_width=True):
+            st.session_state.editing = True
 
-# ─── Empty State Handling ────────────────────────────────────────────────────
+    # ─── Step 4: Edit Mode ───────────────────────────────────────────────────
+    if st.session_state.editing and st.session_state.df is not None:
+        st.subheader("4. Edit Table of Contents")
+        edited_df = st.data_editor(
+            st.session_state.df,
+            key="toc_editor",
+            num_rows="dynamic",
+            use_container_width=True,
+            height=400
+        )
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("💾 Save Changes", use_container_width=True, type="primary"):
+                st.session_state.df = edited_df
+                st.session_state.editing = False
+                st.success("Changes saved successfully!")
+        with col2:
+            if st.button("❌ Cancel Editing", use_container_width=True):
+                st.session_state.editing = False
 
-if not st.session_state.raw_pdf_bytes:
-    st.info("👆 Step 1: Upload a PDF document to get started")
-elif not st.session_state.extracted:
-    st.info("✨ Step 2: Click 'Extract TOC' to process your PDF")
+    # ─── Step 5/6: Download CSV ──────────────────────────────────────────────
+    if st.session_state.extracted and st.session_state.df is not None:
+        st.subheader("5. Download Results")
+        csv_data = st.session_state.df.to_csv(index=False).encode("utf-8")
+        csv_name = f"{os.path.splitext(st.session_state.pdf_name)[0]}_TOC.csv" if st.session_state.pdf_name else "table_of_contents.csv"
+        
+        st.download_button(
+            label="💾 Download as CSV",
+            data=csv_data,
+            file_name=csv_name,
+            mime="text/csv",
+            use_container_width=True,
+            type="primary"
+        )
+
+    # ─── PDF Preview Section ─────────────────────────────────────────────────
+    if st.session_state.raw_pdf_bytes:
+        st.divider()
+        st.subheader("PDF Preview")
+        st.download_button(
+            label="⬇️ Download Original PDF",
+            data=st.session_state.raw_pdf_bytes,
+            file_name=st.session_state.pdf_name,
+            mime="application/pdf",
+            use_container_width=True
+        )
+        
+        try:
+            # Base64 preview fallback
+            b64_pdf = base64.b64encode(st.session_state.raw_pdf_bytes).decode("utf-8")
+            pdf_display = f"""
+            <iframe
+                src="data:application/pdf;base64,{b64_pdf}"
+                width="100%"
+                height="600px"
+                style="border: 1px solid #eee; border-radius: 8px;"
+            ></iframe>
+            """
+            components.html(pdf_display, height=600)
+        except Exception as e:
+            st.warning(f"Preview unavailable: {str(e)}. Please download the PDF to view it.")
+
+# Run the main function
+if __name__ == "__main__":
+    main()

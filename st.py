@@ -1,38 +1,47 @@
 import os
 import re
 import tempfile
-import base64
-import uuid
+
+from typing import List, Dict
 
 import pandas as pd
 import PyPDF2
 import pytesseract
 from pdf2image import convert_from_path
 import streamlit as st
-import streamlit.components.v1 as components
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 script_dir = os.path.dirname(os.path.abspath(__file__)) if "__file__" in locals() else os.getcwd()
 POPPLER_PATH = os.path.join(script_dir, "poppler", "bin")
-TESSERACT_CMD = r"C:\Program Files\Tesseract-OCR\tesseract.exe" if os.name == 'nt' else "/usr/bin/tesseract"
+TESSERACT_CMD = (
+    r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+    if os.name == "nt"
+    else "/usr/bin/tesseract"
+)
 pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
 
 
-def get_poppler_path():
+def get_poppler_path() -> str:
     return POPPLER_PATH
 
-def convert_hindi_digits(text):
-    """Convert Devanagari (Hindi) digits to Arabic numerals."""
-    hindi_digits = {
-        "०": "0", "१": "1", "२": "2", "३": "3", "४": "4",
-        "५": "5", "६": "6", "७": "7", "८": "8", "९": "9",
-    }
-    return "".join(hindi_digits.get(ch, ch) for ch in text)
 
-def extract_page_text(pdf_path, page_num, lang="eng"):
-    """Extract text from a single page (0-based index)."""
+def strip_hindi_chars(text: str) -> str:
+    """
+    Remove any Devanagari (Hindi) characters from `text`.
+    Devanagari Unicode block: U+0900–U+097F
+    """
+    return re.sub(r"[\u0900-\u097F]+", "", text)
+
+
+def extract_page_text(pdf_path: str, page_num: int, lang: str = "eng") -> str:
+    """
+    Extract text from a single page (0-based index). If no text is found,
+    attempt OCR—only if Poppler is actually installed. Finally, strip out
+    any Hindi characters so that only English remains.
+    """
     text = ""
     poppler_path = get_poppler_path()
+    poppler_exists = os.path.exists(os.path.join(poppler_path, "pdftoppm"))
 
     with open(pdf_path, "rb") as f:
         reader = PyPDF2.PdfReader(f)
@@ -40,38 +49,49 @@ def extract_page_text(pdf_path, page_num, lang="eng"):
             page = reader.pages[page_num]
             page_text = page.extract_text() or ""
 
-            if not page_text.strip():
+            # If PDF‐embedded text is empty/whitespace and Poppler is available, do OCR
+            if not page_text.strip() and poppler_exists:
                 try:
                     images = convert_from_path(
                         pdf_path,
                         first_page=page_num + 1,
                         last_page=page_num + 1,
-                        poppler_path=(poppler_path if os.path.exists(os.path.join(poppler_path, "pdftoppm")) else None),
+                        poppler_path=poppler_path,
                         dpi=400,
                         grayscale=True,
                     )
                     if images:
                         img = images[0]
-                        page_text = pytesseract.image_to_string(img, lang=lang, config="--psm 6")
-                except Exception as e:
-                    st.error(f"OCR failed on page {page_num+1}: {str(e)}")
+                        page_text = pytesseract.image_to_string(
+                            img, lang=lang, config="--psm 6"
+                        )
+                except Exception:
                     page_text = ""
 
-            text = page_text + "\n"
+            # Strip out any Hindi characters before returning
+            text = strip_hindi_chars(page_text) + "\n"
 
     return text
 
-def extract_text_from_pages(pdf_path, page_indices, lang="eng"):
-    """Extract text from specified pages."""
+
+def extract_text_from_pages(pdf_path: str, page_indices: List[int], lang: str = "eng") -> str:
+    """
+    Extract (or OCR) text from a list of page indices, stripping Hindi.
+    """
     accumulated = ""
     for idx in page_indices:
         accumulated += extract_page_text(pdf_path, idx, lang=lang)
     return accumulated
 
-def extract_text_from_pdf(pdf_path, lang="eng"):
-    """Extract text from the entire PDF."""
+
+def extract_text_from_pdf(pdf_path: str, lang: str = "eng") -> str:
+    """
+    Extract (or OCR) text from the entire PDF, page by page.
+    Each page’s extracted text is stripped of Hindi characters before concatenation.
+    """
     text = ""
     poppler_path = get_poppler_path()
+    poppler_exists = os.path.exists(os.path.join(poppler_path, "pdftoppm"))
 
     with open(pdf_path, "rb") as f:
         reader = PyPDF2.PdfReader(f)
@@ -81,78 +101,112 @@ def extract_text_from_pdf(pdf_path, lang="eng"):
             page = reader.pages[page_num]
             page_text = page.extract_text() or ""
 
-            if not page_text.strip():
+            if not page_text.strip() and poppler_exists:
                 try:
                     images = convert_from_path(
                         pdf_path,
                         first_page=page_num + 1,
                         last_page=page_num + 1,
-                        poppler_path=(poppler_path if os.path.exists(os.path.join(poppler_path, "pdftoppm")) else None),
+                        poppler_path=poppler_path,
                         dpi=400,
                         grayscale=True,
                     )
                     if images:
                         img = images[0]
-                        page_text = pytesseract.image_to_string(img, lang=lang, config="--psm 6")
-                except Exception as e:
-                    st.error(f"OCR failed on page {page_num+1}: {str(e)}")
+                        page_text = pytesseract.image_to_string(
+                            img, lang=lang, config="--psm 6"
+                        )
+                except Exception:
                     page_text = ""
 
-            text += page_text + "\n"
+            # Strip out any Hindi characters
+            text += strip_hindi_chars(page_text) + "\n"
 
     return text
 
-def find_toc_page_indices(pdf_path):
-    """Find pages containing TOC keywords."""
-    try:
-        reader = PyPDF2.PdfReader(pdf_path)
-        keywords = ["table of contents", "contents", "foreword", "preface"]
-        indices = []
 
-        for i in range(len(reader.pages)):
-            page = reader.pages[i]
-            raw_text = page.extract_text() or ""
-            lower = raw_text.lower()
-            if any(kw in lower for kw in keywords):
-                indices.append(i)
-        return indices
-    except Exception as e:
-        st.error(f"Error finding TOC pages: {str(e)}")
-        return []
-
-def parse_toc(text, is_hindi=False):
-    """Parse TOC lines into chapter-page entries."""
-    entries = []
-    skip_terms_eng = ["table of contents", "contents", "page", "chap", "toc"]
-    skip_terms_hindi = ["विषय सूची", "अनुक्रमणिका", "सामग्री", "पृष्ठ", "अध्याय"]
+def parse_toc(text: str) -> List[Dict[str, str]]:
+    """
+    Parse TOC lines into chapter–page entries (English only).
+    Patterns matched: "Chapter Title ........ 12" or "Chapter Title - 12"
+    """
+    entries: List[Dict[str, str]] = []
+    skip_terms = ["table of contents", "contents", "page", "chap", "toc"]
 
     for raw_line in text.split("\n"):
         line = raw_line.strip()
         if not line or len(line) < 3:
             continue
 
-        if is_hindi:
-            if any(term in line for term in skip_terms_hindi):
-                continue
-        else:
-            if any(term in line.lower() for term in skip_terms_eng):
-                continue
+        # Skip lines that clearly say “Contents” or “Page”
+        if any(term in line.lower() for term in skip_terms):
+            continue
 
-        if is_hindi:
-            m = re.match(r"^(.*\S)\s+([०१२३४५६७८९\d]+)$", line)
-            if m:
-                chapter = m.group(1).strip()
-                page_raw = m.group(2).strip()
-                page = convert_hindi_digits(page_raw)
-                entries.append({"chapter": chapter, "page": page})
-        else:
-            m = re.match(r"^(.*?)[\s\.\-]+(\d+)\s*$", line)
-            if m:
-                chapter = m.group(1).strip()
-                page = m.group(2).strip()
-                entries.append({"chapter": chapter, "page": page})
+        # Match "Some Chapter Name ….. 5"
+        m = re.match(r"^(.*?)[\s\.\-]+(\d+)\s*$", line)
+        if m:
+            chapter = m.group(1).strip()
+            page = m.group(2).strip()
+            entries.append({"chapter": chapter, "page": page})
 
     return entries
+
+
+def find_toc_page_indices(pdf_path: str, max_search_pages: int = 20) -> List[int]:
+    """
+    Find pages (within the first `max_search_pages` pages) that contain a valid
+    TOC structure. We:
+      1. Extract text (or OCR if necessary and if Poppler exists).
+      2. Strip out Hindi chars immediately.
+      3. Check for the word “contents” → if present, run `parse_toc` on that page.
+      4. If parse_toc yields ≥ 2 entries, mark this page as a TOC page.
+    """
+    indices: List[int] = []
+    poppler_path = get_poppler_path()
+    poppler_exists = os.path.exists(os.path.join(poppler_path, "pdftoppm"))
+
+    try:
+        reader = PyPDF2.PdfReader(pdf_path)
+        num_pages = len(reader.pages)
+        search_limit = min(num_pages, max_search_pages)
+
+        for i in range(search_limit):
+            # Attempt simple text extraction first
+            page = reader.pages[i]
+            raw_text = page.extract_text() or ""
+
+            # If no text and Poppler is available, do a single‐page OCR
+            if not raw_text.strip() and poppler_exists:
+                try:
+                    images = convert_from_path(
+                        pdf_path,
+                        first_page=i + 1,
+                        last_page=i + 1,
+                        poppler_path=poppler_path,
+                        dpi=300,
+                        grayscale=True,
+                    )
+                    if images:
+                        raw_text = pytesseract.image_to_string(images[0], lang="eng")
+                except Exception:
+                    raw_text = ""
+
+            # Strip Hindi chars now
+            raw_text = strip_hindi_chars(raw_text)
+            lower = raw_text.lower()
+
+            # Quick keyword check
+            if "contents" in lower or "table of contents" in lower:
+                # If we see “contents”, attempt to parse lines on that page alone.
+                entries_on_page = parse_toc(raw_text)
+                if len(entries_on_page) >= 2:
+                    indices.append(i)
+                    # Continue scanning; TOC can span multiple pages
+        return indices
+
+    except Exception as e:
+        st.error(f"Error finding TOC pages: {e}")
+        return []
 
 
 # ─── Streamlit UI ──────────────────────────────────────────────────────────────
@@ -161,32 +215,36 @@ st.set_page_config(page_title="PDF TOC Extractor", layout="wide")
 st.title("📄 PDF Table of Contents Extractor")
 
 # Initialize session state variables
-if 'extracted' not in st.session_state:
+if "extracted" not in st.session_state:
     st.session_state.extracted = False
-if 'editing' not in st.session_state:
+if "editing" not in st.session_state:
     st.session_state.editing = False
-if 'df' not in st.session_state:
+if "df" not in st.session_state:
     st.session_state.df = None
-if 'pdf_name' not in st.session_state:
+if "pdf_name" not in st.session_state:
     st.session_state.pdf_name = ""
-if 'raw_pdf_bytes' not in st.session_state:
+if "raw_pdf_bytes" not in st.session_state:
     st.session_state.raw_pdf_bytes = None
 
-# Main workflow logic
+
 def main():
     with st.expander("ℹ️ How to use", expanded=True):
-        st.write("""
-        1. **Upload PDF** - Upload any PDF document
-        2. **Extract TOC** - Click the button to extract the Table of Contents
-        3. **View TOC** - Review the extracted table
-        4. **Edit TOC** - Click the edit button to make changes
-        5. **Save Changes** - Save your edits when done
-        6. **Download** - Export the final TOC as a CSV file
-        """)
+        st.write(
+            """
+        1. **Upload PDF** – Upload any PDF document  
+        2. **Extract TOC** – Click the button to extract the Table of Contents  
+        3. **View TOC** – Review the extracted table  
+        4. **Edit TOC** – Click the edit button to make changes  
+        5. **Save Changes** – Save your edits when done  
+        6. **Download** – Export the final TOC as a CSV file  
+        """
+        )
 
     # ─── Step 1: File Upload ──────────────────────────────────────────────────
     st.subheader("1. Upload PDF")
-    uploaded_file = st.file_uploader("Choose a PDF file", type=["pdf"], label_visibility="collapsed")
+    uploaded_file = st.file_uploader(
+        "Choose a PDF file", type=["pdf"], label_visibility="collapsed"
+    )
 
     if uploaded_file and st.session_state.raw_pdf_bytes is None:
         pdf_bytes = uploaded_file.read()
@@ -198,27 +256,30 @@ def main():
     # ─── Step 2: Extract TOC ─────────────────────────────────────────────────
     if st.session_state.raw_pdf_bytes and not st.session_state.extracted:
         st.subheader("2. Extract Table of Contents")
-        
+
         with st.form("extract_form"):
-            language = st.selectbox("OCR Language", ("eng", "hin", "both"), index=0)
+            # Only English OCR is needed, since we strip out any Hindi characters
+            language = st.selectbox("OCR Language", ("eng",), index=0, disabled=True)
             if st.form_submit_button("🔍 Extract TOC"):
                 with st.spinner("Extracting TOC..."):
+                    # Write PDF bytes to a temporary file
                     with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
                         tmp.write(st.session_state.raw_pdf_bytes)
                         tmp_path = tmp.name
-                    
-                    is_hindi = (language == "hin" or language == "both")
-                    ocr_lang = "eng+hin" if language == "both" else language
-                    
+
                     try:
-                        toc_indices = find_toc_page_indices(tmp_path)
+                        # 1) Find the most likely TOC pages (within first 20 pages)
+                        toc_indices = find_toc_page_indices(tmp_path, max_search_pages=20)
+
                         if toc_indices:
-                            raw_text = extract_text_from_pages(tmp_path, toc_indices, lang=ocr_lang)
+                            # 2) Extract full text from those pages (OCR if needed), then parse
+                            raw_text = extract_text_from_pages(tmp_path, toc_indices, lang="eng")
                         else:
-                            raw_text = extract_text_from_pdf(tmp_path, lang=ocr_lang)
-                        
-                        toc_entries = parse_toc(raw_text, is_hindi=is_hindi)
-                        
+                            # If none found in first 20, fall back to entire PDF
+                            raw_text = extract_text_from_pdf(tmp_path, lang="eng")
+
+                        toc_entries = parse_toc(raw_text)
+
                         if toc_entries:
                             st.session_state.df = pd.DataFrame(toc_entries)
                             st.session_state.extracted = True
@@ -226,7 +287,7 @@ def main():
                         else:
                             st.warning("No TOC entries detected.")
                     except Exception as e:
-                        st.error(f"Extraction error: {str(e)}")
+                        st.error(f"Extraction error: {e}")
                     finally:
                         if os.path.exists(tmp_path):
                             os.remove(tmp_path)
@@ -235,7 +296,7 @@ def main():
     if st.session_state.extracted and st.session_state.df is not None:
         st.subheader("3. Extracted Table of Contents")
         st.dataframe(st.session_state.df, use_container_width=True, height=400)
-        
+
         if st.button("✏️ Edit TOC", use_container_width=True):
             st.session_state.editing = True
 
@@ -247,9 +308,9 @@ def main():
             key="toc_editor",
             num_rows="dynamic",
             use_container_width=True,
-            height=400
+            height=400,
         )
-        
+
         col1, col2 = st.columns(2)
         with col1:
             if st.button("💾 Save Changes", use_container_width=True, type="primary"):
@@ -264,44 +325,21 @@ def main():
     if st.session_state.extracted and st.session_state.df is not None:
         st.subheader("5. Download Results")
         csv_data = st.session_state.df.to_csv(index=False).encode("utf-8")
-        csv_name = f"{os.path.splitext(st.session_state.pdf_name)[0]}_TOC.csv" if st.session_state.pdf_name else "table_of_contents.csv"
-        
+        csv_name = (
+            f"{os.path.splitext(st.session_state.pdf_name)[0]}_TOC.csv"
+            if st.session_state.pdf_name
+            else "table_of_contents.csv"
+        )
+
         st.download_button(
             label="💾 Download as CSV",
             data=csv_data,
             file_name=csv_name,
             mime="text/csv",
             use_container_width=True,
-            type="primary"
+            type="primary",
         )
 
-    # ─── PDF Preview Section ─────────────────────────────────────────────────
-    if st.session_state.raw_pdf_bytes:
-        st.divider()
-        st.subheader("PDF Preview")
-        st.download_button(
-            label="⬇️ Download Original PDF",
-            data=st.session_state.raw_pdf_bytes,
-            file_name=st.session_state.pdf_name,
-            mime="application/pdf",
-            use_container_width=True
-        )
-        
-        try:
-            # Base64 preview fallback
-            b64_pdf = base64.b64encode(st.session_state.raw_pdf_bytes).decode("utf-8")
-            pdf_display = f"""
-            <iframe
-                src="data:application/pdf;base64,{b64_pdf}"
-                width="100%"
-                height="600px"
-                style="border: 1px solid #eee; border-radius: 8px;"
-            ></iframe>
-            """
-            components.html(pdf_display, height=600)
-        except Exception as e:
-            st.warning(f"Preview unavailable: {str(e)}. Please download the PDF to view it.")
 
-# Run the main function
 if __name__ == "__main__":
     main()

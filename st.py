@@ -11,7 +11,9 @@ from pdf2image import convert_from_path
 import streamlit as st
 
 # ─── Configuration ────────────────────────────────────────────────────────────
-script_dir = os.path.dirname(os.path.abspath(__file__)) if "__file__" in locals() else os.getcwd()
+script_dir = (
+    os.path.dirname(os.path.abspath(__file__)) if "__file__" in locals() else os.getcwd()
+)
 POPPLER_PATH = os.path.join(script_dir, "poppler", "bin")
 TESSERACT_CMD = (
     r"C:\Program Files\Tesseract-OCR\tesseract.exe"
@@ -35,11 +37,11 @@ def strip_hindi_chars(text: str) -> str:
 
 def extract_page_text(pdf_path: str, page_num: int, lang: str = "eng") -> str:
     """
-    Extract text from a single page (0-based index). If no text is found,
-    attempt OCR—only if Poppler is actually installed. Finally, strip out
-    any Hindi characters so that only English remains.
+    Extract text from a single page (0-based). If the PDF‐embedded text is empty,
+    attempt OCR—only if Poppler (pdftoppm) exists. Do NOT strip Hindi here; that
+    will be done later per-line.
     """
-    text = ""
+    page_text = ""
     poppler_path = get_poppler_path()
     poppler_exists = os.path.exists(os.path.join(poppler_path, "pdftoppm"))
 
@@ -49,7 +51,7 @@ def extract_page_text(pdf_path: str, page_num: int, lang: str = "eng") -> str:
             page = reader.pages[page_num]
             page_text = page.extract_text() or ""
 
-            # If PDF‐embedded text is empty/whitespace and Poppler is available, do OCR
+            # If PDF text is blank/whitespace, attempt OCR
             if not page_text.strip() and poppler_exists:
                 try:
                     images = convert_from_path(
@@ -68,15 +70,15 @@ def extract_page_text(pdf_path: str, page_num: int, lang: str = "eng") -> str:
                 except Exception:
                     page_text = ""
 
-            # Strip out any Hindi characters before returning
-            text = strip_hindi_chars(page_text) + "\n"
-
-    return text
+    return page_text + "\n"
 
 
-def extract_text_from_pages(pdf_path: str, page_indices: List[int], lang: str = "eng") -> str:
+def extract_text_from_pages(
+    pdf_path: str, page_indices: List[int], lang: str = "eng"
+) -> str:
     """
-    Extract (or OCR) text from a list of page indices, stripping Hindi.
+    Extract (or OCR) text from the specified pages. Hindi characters
+    remain in the returned string; parsing will strip them line by line.
     """
     accumulated = ""
     for idx in page_indices:
@@ -86,10 +88,9 @@ def extract_text_from_pages(pdf_path: str, page_indices: List[int], lang: str = 
 
 def extract_text_from_pdf(pdf_path: str, lang: str = "eng") -> str:
     """
-    Extract (or OCR) text from the entire PDF, page by page.
-    Each page’s extracted text is stripped of Hindi characters before concatenation.
+    Extract (or OCR) text from all pages, concatenated. Hindi remains until parsing.
     """
-    text = ""
+    full_text = ""
     poppler_path = get_poppler_path()
     poppler_exists = os.path.exists(os.path.join(poppler_path, "pdftoppm"))
 
@@ -119,47 +120,53 @@ def extract_text_from_pdf(pdf_path: str, lang: str = "eng") -> str:
                 except Exception:
                     page_text = ""
 
-            # Strip out any Hindi characters
-            text += strip_hindi_chars(page_text) + "\n"
+            full_text += page_text + "\n"
 
-    return text
+    return full_text
 
 
 def parse_toc(text: str) -> List[Dict[str, str]]:
     """
-    Parse TOC lines into chapter–page entries (English only).
-    Patterns matched: "Chapter Title ........ 12" or "Chapter Title - 12"
+    Given a block of text (which may still contain Hindi), examine each line as follows:
+    1. Strip out any Devanagari chars (so only English/digits/punctuation remain).
+    2. Skip lines containing 'contents', 'page', etc., in English.
+    3. Apply a regex to capture "Chapter Title … 12" or "Chapter Title - 12".
     """
     entries: List[Dict[str, str]] = []
     skip_terms = ["table of contents", "contents", "page", "chap", "toc"]
 
     for raw_line in text.split("\n"):
+        # 1) Remove leading/trailing whitespace
         line = raw_line.strip()
         if not line or len(line) < 3:
             continue
 
-        # Skip lines that clearly say “Contents” or “Page”
-        if any(term in line.lower() for term in skip_terms):
+        # 2) Strip out Hindi characters from this line only
+        cleaned = strip_hindi_chars(line)
+
+        # 3) If the cleaned line still contains any of the skip terms, skip it
+        lower_cleaned = cleaned.lower()
+        if any(term in lower_cleaned for term in skip_terms):
             continue
 
-        # Match "Some Chapter Name ….. 5"
-        m = re.match(r"^(.*?)[\s\.\-]+(\d+)\s*$", line)
+        # 4) Try to match "Some Chapter Name …. 5" or "Some Chapter Name - 5"
+        m = re.match(r"^(.*?)[\s\.\-]+(\d+)\s*$", cleaned)
         if m:
             chapter = m.group(1).strip()
-            page = m.group(2).strip()
-            entries.append({"chapter": chapter, "page": page})
+            page_no = m.group(2).strip()
+            entries.append({"chapter": chapter, "page": page_no})
 
     return entries
 
 
 def find_toc_page_indices(pdf_path: str, max_search_pages: int = 20) -> List[int]:
     """
-    Find pages (within the first `max_search_pages` pages) that contain a valid
-    TOC structure. We:
-      1. Extract text (or OCR if necessary and if Poppler exists).
-      2. Strip out Hindi chars immediately.
-      3. Check for the word “contents” → if present, run `parse_toc` on that page.
-      4. If parse_toc yields ≥ 2 entries, mark this page as a TOC page.
+    Look at the first `max_search_pages` pages of the PDF (or fewer if the PDF is shorter).
+    For each page:
+      1. Extract text (via PyPDF2). If blank and poppler exists, do OCR.
+      2. Check the raw text (with both English & Hindi still present) for the substring "contents" (case‐insensitive).
+      3. If "contents" is found, run parse_toc(...) on that raw text. If parse_toc returns ≥ 2 entries, mark this page as TOC.
+    Return a list of all page indices that look like TOC pages.
     """
     indices: List[int] = []
     poppler_path = get_poppler_path()
@@ -171,11 +178,10 @@ def find_toc_page_indices(pdf_path: str, max_search_pages: int = 20) -> List[int
         search_limit = min(num_pages, max_search_pages)
 
         for i in range(search_limit):
-            # Attempt simple text extraction first
             page = reader.pages[i]
             raw_text = page.extract_text() or ""
 
-            # If no text and Poppler is available, do a single‐page OCR
+            # If PDF text is blank and poppler exists, do a quick page‐OCR
             if not raw_text.strip() and poppler_exists:
                 try:
                     images = convert_from_path(
@@ -191,17 +197,15 @@ def find_toc_page_indices(pdf_path: str, max_search_pages: int = 20) -> List[int
                 except Exception:
                     raw_text = ""
 
-            # Strip Hindi chars now
-            raw_text = strip_hindi_chars(raw_text)
-            lower = raw_text.lower()
-
-            # Quick keyword check
-            if "contents" in lower or "table of contents" in lower:
-                # If we see “contents”, attempt to parse lines on that page alone.
-                entries_on_page = parse_toc(raw_text)
-                if len(entries_on_page) >= 2:
+            lower_all = raw_text.lower()
+            # We look for the English word "contents" (case‐insensitive) in the raw text
+            if "contents" in lower_all:
+                # Now see if parsing that page yields ≥ 2 valid TOC entries
+                possible_entries = parse_toc(raw_text)
+                if len(possible_entries) >= 2:
                     indices.append(i)
-                    # Continue scanning; TOC can span multiple pages
+                    # Don’t break—TOC can span multiple consecutive pages
+
         return indices
 
     except Exception as e:
@@ -214,7 +218,7 @@ def find_toc_page_indices(pdf_path: str, max_search_pages: int = 20) -> List[int
 st.set_page_config(page_title="PDF TOC Extractor", layout="wide")
 st.title("📄 PDF Table of Contents Extractor")
 
-# Initialize session state variables
+# Initialize session state
 if "extracted" not in st.session_state:
     st.session_state.extracted = False
 if "editing" not in st.session_state:
@@ -232,15 +236,15 @@ def main():
         st.write(
             """
         1. **Upload PDF** – Upload any PDF document  
-        2. **Extract TOC** – Click the button to extract the Table of Contents  
+        2. **Extract TOC** – Click the button to extract the Table of Contents (and include extra pages if desired)  
         3. **View TOC** – Review the extracted table  
         4. **Edit TOC** – Click the edit button to make changes  
         5. **Save Changes** – Save your edits when done  
-        6. **Download** – Export the final TOC as a CSV file  
+        6. **Download** – Export the final TOC as a CSV file (or download an empty template if no TOC was found)  
         """
         )
 
-    # ─── Step 1: File Upload ──────────────────────────────────────────────────
+    # ─── Step 1: Upload PDF ───────────────────────────────────────────────────
     st.subheader("1. Upload PDF")
     uploaded_file = st.file_uploader(
         "Choose a PDF file", type=["pdf"], label_visibility="collapsed"
@@ -250,34 +254,57 @@ def main():
         pdf_bytes = uploaded_file.read()
         st.session_state.raw_pdf_bytes = pdf_bytes
         st.session_state.pdf_name = uploaded_file.name
-        st.session_state.extracted = False  # Reset extraction state on new upload
+        st.session_state.extracted = False
         st.success("PDF uploaded successfully!")
 
     # ─── Step 2: Extract TOC ─────────────────────────────────────────────────
     if st.session_state.raw_pdf_bytes and not st.session_state.extracted:
         st.subheader("2. Extract Table of Contents")
-
         with st.form("extract_form"):
-            # Only English OCR is needed, since we strip out any Hindi characters
-            language = st.selectbox("OCR Language", ("eng",), index=0, disabled=True)
+            # We force English OCR—Hindi characters will be stripped per-line later
+            st.selectbox("OCR Language", ("eng",), index=0, disabled=True)
+
+            # Allow user to choose how many extra pages (after each detected TOC page) to include, up to 6
+            extra_pages = st.number_input(
+                "Include how many extra pages after each detected TOC page?",
+                min_value=0,
+                max_value=6,  # <-- Changed to allow up to 6
+                value=2,
+                help="If you notice that some TOC entries span into subsequent pages, increase this value.",
+            )
+
             if st.form_submit_button("🔍 Extract TOC"):
                 with st.spinner("Extracting TOC..."):
-                    # Write PDF bytes to a temporary file
+                    # Save uploaded PDF to a temp file
                     with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
                         tmp.write(st.session_state.raw_pdf_bytes)
                         tmp_path = tmp.name
 
                     try:
-                        # 1) Find the most likely TOC pages (within first 20 pages)
+                        # 1) Find potential TOC pages among the first 20 pages
                         toc_indices = find_toc_page_indices(tmp_path, max_search_pages=20)
 
                         if toc_indices:
-                            # 2) Extract full text from those pages (OCR if needed), then parse
-                            raw_text = extract_text_from_pages(tmp_path, toc_indices, lang="eng")
+                            # Expand each found index by extra_pages (making sure not to exceed num_pages)
+                            reader = PyPDF2.PdfReader(tmp_path)
+                            num_pages = len(reader.pages)
+
+                            expanded_indices = set()
+                            for i in toc_indices:
+                                for offset in range(0, extra_pages + 1):
+                                    candidate = i + offset
+                                    if candidate < num_pages:
+                                        expanded_indices.add(candidate)
+                            final_indices = sorted(expanded_indices)
+
+                            # 2) Extract text from all expanded TOC pages (OCR if needed)
+                            raw_text = extract_text_from_pages(tmp_path, final_indices, lang="eng")
+
                         else:
-                            # If none found in first 20, fall back to entire PDF
+                            # If none detected, fall back to entire PDF
                             raw_text = extract_text_from_pdf(tmp_path, lang="eng")
 
+                        # 3) Parse the collected text to extract chapter→page entries
                         toc_entries = parse_toc(raw_text)
 
                         if toc_entries:
@@ -286,6 +313,16 @@ def main():
                             st.success(f"Extracted {len(toc_entries)} TOC entries")
                         else:
                             st.warning("No TOC entries detected.")
+                            # Offer an empty CSV template with columns Page no, Chapter name
+                            empty_df = pd.DataFrame(columns=["Page no", "Chapter name"])
+                            csv_data_empty = empty_df.to_csv(index=False).encode("utf-8")
+                            st.download_button(
+                                label="💾 Download Empty TOC Template (CSV)",
+                                data=csv_data_empty,
+                                file_name="empty_TOC_template.csv",
+                                mime="text/csv",
+                                use_container_width=True,
+                            )
                     except Exception as e:
                         st.error(f"Extraction error: {e}")
                     finally:
@@ -296,7 +333,6 @@ def main():
     if st.session_state.extracted and st.session_state.df is not None:
         st.subheader("3. Extracted Table of Contents")
         st.dataframe(st.session_state.df, use_container_width=True, height=400)
-
         if st.button("✏️ Edit TOC", use_container_width=True):
             st.session_state.editing = True
 
@@ -310,7 +346,6 @@ def main():
             use_container_width=True,
             height=400,
         )
-
         col1, col2 = st.columns(2)
         with col1:
             if st.button("💾 Save Changes", use_container_width=True, type="primary"):
@@ -330,9 +365,8 @@ def main():
             if st.session_state.pdf_name
             else "table_of_contents.csv"
         )
-
         st.download_button(
-            label="💾 Download as CSV",
+            label="💾 Download TOC as CSV",
             data=csv_data,
             file_name=csv_name,
             mime="text/csv",

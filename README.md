@@ -1,2 +1,2 @@
 pip install -r requirements.txt
-streamlit run aa.py
+streamlit run st.py

@@ -127,35 +127,52 @@ def extract_text_from_pdf(pdf_path: str, lang: str = "eng") -> str:
 
 def parse_toc(text: str) -> List[Dict[str, str]]:
     """
-    Given a block of text (which may still contain Hindi), examine each line as follows:
-    1. Strip out any Devanagari chars (so only English/digits/punctuation remain).
-    2. Skip lines containing 'contents', 'page', etc., in English.
-    3. Apply a regex to capture "Chapter Title … 12" or "Chapter Title - 12".
+    Given a block of text (which may still contain Hindi), parse TOC entries by:
+    - Combining lines that are part of the same entry (multi-line titles)
+    - Stripping Hindi characters from combined entries
+    - Skipping entries that contain header terms (like 'contents', 'page', etc.)
+    - Using regex to capture "Chapter Title ... 12" or "Chapter Title - 12"
     """
     entries: List[Dict[str, str]] = []
-    skip_terms = ["table of contents", "contents", "page", "chap", "toc"]
+    skip_terms = ["table of contents", "contents", "page", "toc"]
+    current_entry_lines = []  # Collect lines for the current TOC entry
 
-    for raw_line in text.split("\n"):
-        # 1) Remove leading/trailing whitespace
+    for raw_line in text.split('\n'):
         line = raw_line.strip()
-        if not line or len(line) < 3:
+        if not line:
             continue
-
-        # 2) Strip out Hindi characters from this line only
+        
         cleaned = strip_hindi_chars(line)
-
-        # 3) If the cleaned line still contains any of the skip terms, skip it
-        lower_cleaned = cleaned.lower()
-        if any(term in lower_cleaned for term in skip_terms):
-            continue
-
-        # 4) Try to match "Some Chapter Name …. 5" or "Some Chapter Name - 5"
-        m = re.match(r"^(.*?)[\s\.\-]+(\d+)\s*$", cleaned)
-        if m:
-            chapter = m.group(1).strip()
-            page_no = m.group(2).strip()
-            entries.append({"chapter": chapter, "page": page_no})
-
+        
+        # Check if this line ends with a sequence of digits (page number)
+        if re.search(r'\d+\s*$', cleaned):
+            full_text = ""
+            if current_entry_lines:
+                # Combine buffered lines with current line
+                full_text = " ".join(current_entry_lines) + " " + cleaned
+                current_entry_lines = []  # Reset buffer
+            else:
+                full_text = cleaned
+                
+            # Skip entries that contain header terms
+            lower_text = full_text.lower()
+            if any(term in lower_text for term in skip_terms):
+                continue
+                
+            # Attempt to split into chapter and page number
+            m = re.match(r'^(.*?)[\s\.\-]+\s*(\d+)\s*$', full_text)
+            if not m:
+                # Fallback: match any trailing digits
+                m = re.match(r'^(.*?)(\d+)\s*$', full_text)
+                
+            if m:
+                chapter = m.group(1).strip()
+                page_no = m.group(2).strip()
+                entries.append({"chapter": chapter, "page": page_no})
+        else:
+            # Line doesn't end with page number → buffer it
+            current_entry_lines.append(cleaned)
+            
     return entries
 
 

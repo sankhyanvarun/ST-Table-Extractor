@@ -88,10 +88,6 @@ The application is designed to run on Streamlit Cloud. To deploy:
 3. Configure the Tesseract path in the application code
 4. Deploy to Streamlit Cloud following their documentation
 
-## License
-
-This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
-
 ## Contributing
 
 Contributions are welcome! Please open an issue or submit a pull request for any improvements.

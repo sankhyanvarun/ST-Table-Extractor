@@ -27,6 +27,23 @@ def get_poppler_path() -> str:
     return POPPLER_PATH
 
 
+def truncate_pdf(input_path: str, output_path: str, max_pages: int = 70) -> None:
+    """
+    Create a truncated version of a PDF containing only the first `max_pages`.
+    """
+    reader = PyPDF2.PdfReader(input_path)
+    writer = PyPDF2.PdfWriter()
+    
+    num_pages = len(reader.pages)
+    pages_to_keep = min(max_pages, num_pages)
+    
+    for i in range(pages_to_keep):
+        writer.add_page(reader.pages[i])
+    
+    with open(output_path, "wb") as f:
+        writer.write(f)
+
+
 def strip_hindi_chars(text: str) -> str:
     """
     Remove any Devanagari (Hindi) characters from `text`.
@@ -258,6 +275,8 @@ def main():
         4. **Edit TOC** – Click the edit button to make changes  
         5. **Save Changes** – Save your edits when done  
         6. **Download** – Export the final TOC as a CSV file (or download an empty template if no TOC was found)  
+        
+        **Large PDF Handling**: For files over 100MB, only the first 70 pages will be processed to improve performance.
         """
         )
 
@@ -285,7 +304,7 @@ def main():
             extra_pages = st.number_input(
                 "Include how many extra pages after each detected TOC page?",
                 min_value=0,
-                max_value=6,  # <-- Changed to allow up to 6
+                max_value=6,
                 value=2,
                 help="If you notice that some TOC entries span into subsequent pages, increase this value.",
             )
@@ -295,15 +314,29 @@ def main():
                     # Save uploaded PDF to a temp file
                     with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
                         tmp.write(st.session_state.raw_pdf_bytes)
-                        tmp_path = tmp.name
-
+                        original_tmp_path = tmp.name
+                    
+                    # Check if PDF is large (>100 MB)
+                    file_size = os.path.getsize(original_tmp_path)
+                    is_large_pdf = file_size > 100 * 1024 * 1024  # 100 MB
+                    
+                    if is_large_pdf:
+                        st.info(f"Large PDF detected ({file_size/(1024*1024):.2f} MB). Using first 70 pages for TOC extraction.")
+                        # Create a new temp file for the truncated version
+                        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as trunc_tmp:
+                            truncated_path = trunc_tmp.name
+                        truncate_pdf(original_tmp_path, truncated_path, max_pages=70)
+                        extraction_path = truncated_path
+                    else:
+                        extraction_path = original_tmp_path
+                    
                     try:
                         # 1) Find potential TOC pages among the first 20 pages
-                        toc_indices = find_toc_page_indices(tmp_path, max_search_pages=20)
+                        toc_indices = find_toc_page_indices(extraction_path, max_search_pages=20)
 
                         if toc_indices:
                             # Expand each found index by extra_pages (making sure not to exceed num_pages)
-                            reader = PyPDF2.PdfReader(tmp_path)
+                            reader = PyPDF2.PdfReader(extraction_path)
                             num_pages = len(reader.pages)
 
                             expanded_indices = set()
@@ -315,11 +348,11 @@ def main():
                             final_indices = sorted(expanded_indices)
 
                             # 2) Extract text from all expanded TOC pages (OCR if needed)
-                            raw_text = extract_text_from_pages(tmp_path, final_indices, lang="eng")
+                            raw_text = extract_text_from_pages(extraction_path, final_indices, lang="eng")
 
                         else:
                             # If none detected, fall back to entire PDF
-                            raw_text = extract_text_from_pdf(tmp_path, lang="eng")
+                            raw_text = extract_text_from_pdf(extraction_path, lang="eng")
 
                         # 3) Parse the collected text to extract chapter→page entries
                         toc_entries = parse_toc(raw_text)
@@ -343,8 +376,10 @@ def main():
                     except Exception as e:
                         st.error(f"Extraction error: {e}")
                     finally:
-                        if os.path.exists(tmp_path):
-                            os.remove(tmp_path)
+                        # Clean up temporary files
+                        os.unlink(original_tmp_path)
+                        if is_large_pdf:
+                            os.unlink(extraction_path)  # This is the truncated_path
 
     # ─── Step 3: View TOC ────────────────────────────────────────────────────
     if st.session_state.extracted and st.session_state.df is not None:
@@ -363,6 +398,42 @@ def main():
             use_container_width=True,
             height=400,
         )
+        
+        # New row insertion functionality
+        st.subheader("Insert New Row")
+        col_insert, col_btn = st.columns([3, 1])
+        with col_insert:
+            # Let user select insertion position (1-indexed)
+            insert_position = st.number_input(
+                "Insert at row number:",
+                min_value=1,
+                max_value=len(edited_df) + 1,
+                value=1,
+                help="Enter the position where you want to insert a new row"
+            )
+        with col_btn:
+            st.write("")  # For vertical alignment
+            if st.button("➕ Insert Empty Row", use_container_width=True):
+                # Create an empty row
+                empty_row = {col: "" for col in edited_df.columns}
+                
+                # Convert to 0-indexed position
+                pos = insert_position - 1
+                
+                # Split the DataFrame and insert the new row
+                top_part = edited_df.iloc[:pos]
+                bottom_part = edited_df.iloc[pos:]
+                
+                # Combine with the new row
+                edited_df = pd.concat(
+                    [top_part, pd.DataFrame([empty_row]), bottom_part],
+                    ignore_index=True
+                )
+                
+                # Update the edited DataFrame
+                st.session_state.df = edited_df
+                st.rerun()  # Refresh to show the new row
+        
         col1, col2 = st.columns(2)
         with col1:
             if st.button("💾 Save Changes", use_container_width=True, type="primary"):

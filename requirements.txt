@@ -3,3 +3,9 @@ pandas
 PyPDF2
 pdf2image
 pytesseract
+numpy
+typing
+tempfile
+re
+os
+PIL

@@ -1,63 +1,36 @@
-import streamlit as st
-import pytesseract
-from pdf2image import convert_from_path
-from PIL import Image, ImageEnhance, ImageFilter
-import re
 import os
-import pandas as pd
+import re
 import tempfile
-import PyPDF2
-import numpy as np
+
 from typing import List, Dict
 
-# Set page config
-st.set_page_config(page_title="Enhanced Multi-Language TOC Extractor", layout="wide")
+import pandas as pd
+import PyPDF2
+import pytesseract
+from pdf2image import convert_from_path
+import streamlit as st
 
-# Initialize session state
-if 'toc_df' not in st.session_state:
-    st.session_state.toc_df = pd.DataFrame(columns=["Title", "Page"])
-if 'raw_text' not in st.session_state:
-    st.session_state.raw_text = ""
-if 'language' not in st.session_state:
-    st.session_state.language = "Hindi"
-if 'poppler_path' not in st.session_state:
-    st.session_state.poppler_path = 'poppler/bin'
-if 'tesseract_path' not in st.session_state:
-    st.session_state.tesseract_path = 'tesseract.exe'
-if 'extra_pages' not in st.session_state:
-    st.session_state.extra_pages = 2
-if 'edit_mode' not in st.session_state:
-    st.session_state.edit_mode = False
-if 'new_col_name' not in st.session_state:
-    st.session_state.new_col_name = ""
-if 'new_col_default' not in st.session_state:
-    st.session_state.new_col_default = ""
+# ─── Configuration ────────────────────────────────────────────────────────────
+script_dir = (
+    os.path.dirname(os.path.abspath(__file__)) if "__file__" in locals() else os.getcwd()
+)
+POPPLER_PATH = os.path.join(script_dir, "poppler", "bin")
+TESSERACT_CMD = (
+    r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+    if os.name == "nt"
+    else "/usr/bin/tesseract"
+)
+pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
 
-# Hindi digit map
-HINDI_DIGIT_MAP = {
-    '०': '0', '१': '1', '२': '2', '३': '3', '४': '4',
-    '५': '5', '६': '6', '७': '7', '८': '8', '९': '9'
-}
 
-# ========== COMMON FUNCTIONS ==========
-def get_total_pages(pdf_path):
-    try:
-        with open(pdf_path, "rb") as f:
-            reader = PyPDF2.PdfReader(f)
-            return len(reader.pages)
-    except Exception:
-        return 0
+def get_poppler_path() -> str:
+    return POPPLER_PATH
 
-def enhance_image(img):
-    """Apply image enhancement for better OCR results"""
-    img = img.convert('L')  # Convert to grayscale
-    img = img.filter(ImageFilter.MedianFilter())  # Reduce noise
-    enhancer = ImageEnhance.Contrast(img)  # Enhance contrast
-    img = enhancer.enhance(2)  # Increase contrast
-    img = img.point(lambda p: 0 if p < 150 else 255)  # Thresholding
-    return img
 
 def truncate_pdf(input_path: str, output_path: str, max_pages: int = 70) -> None:
+    """
+    Create a truncated version of a PDF containing only the first `max_pages`.
+    """
     reader = PyPDF2.PdfReader(input_path)
     writer = PyPDF2.PdfWriter()
     
@@ -70,166 +43,115 @@ def truncate_pdf(input_path: str, output_path: str, max_pages: int = 70) -> None
     with open(output_path, "wb") as f:
         writer.write(f)
 
-def normalize_hindi_digits(text):
-    return ''.join(HINDI_DIGIT_MAP.get(ch, ch) for ch in text)
 
-# ========== TEXT EXTRACTION FUNCTIONS ==========
-def extract_page_text(pdf_path: str, page_num: int, language: str) -> str:
-    """Extract text from a single page with OCR and enhancement"""
-    try:
-        images = convert_from_path(
-            pdf_path,
-            first_page=page_num + 1,
-            last_page=page_num + 1,
-            poppler_path=st.session_state.poppler_path,
-            dpi=300 if language == "Hindi" else 400,
-            grayscale=True,
-        )
-        if images:
-            img = images[0]
-            enhanced_img = enhance_image(img)  # Apply enhancement to both languages
-            config = r'--oem 1 --psm 6'
-            lang = "hin" if language == "Hindi" else "eng"
-            page_text = pytesseract.image_to_string(enhanced_img, config=config, lang=lang)
-            
-            # Normalize Hindi digits for both languages
-            if language == "Hindi":
-                return normalize_hindi_digits(page_text) + "\n"
-            return page_text + "\n"
-    except Exception:
-        return ""
-    return ""
+def strip_hindi_chars(text: str) -> str:
+    """
+    Remove any Devanagari (Hindi) characters from `text`.
+    Devanagari Unicode block: U+0900–U+097F
+    """
+    return re.sub(r"[\u0900-\u097F]+", "", text)
 
-def extract_text_from_pages(pdf_path: str, page_indices: List[int], language: str) -> str:
-    """Extract text from multiple pages with OCR"""
+
+def extract_page_text(pdf_path: str, page_num: int, lang: str = "eng") -> str:
+    """
+    Extract text from a single page (0-based). If the PDF‐embedded text is empty,
+    attempt OCR—only if Poppler (pdftoppm) exists. Do NOT strip Hindi here; that
+    will be done later per-line.
+    """
+    page_text = ""
+    poppler_path = get_poppler_path()
+    poppler_exists = os.path.exists(os.path.join(poppler_path, "pdftoppm"))
+
+    with open(pdf_path, "rb") as f:
+        reader = PyPDF2.PdfReader(f)
+        if page_num < len(reader.pages):
+            page = reader.pages[page_num]
+            page_text = page.extract_text() or ""
+
+            # If PDF text is blank/whitespace, attempt OCR
+            if not page_text.strip() and poppler_exists:
+                try:
+                    images = convert_from_path(
+                        pdf_path,
+                        first_page=page_num + 1,
+                        last_page=page_num + 1,
+                        poppler_path=poppler_path,
+                        dpi=400,
+                        grayscale=True,
+                    )
+                    if images:
+                        img = images[0]
+                        page_text = pytesseract.image_to_string(
+                            img, lang=lang, config="--psm 6"
+                        )
+                except Exception:
+                    page_text = ""
+
+    return page_text + "\n"
+
+
+def extract_text_from_pages(
+    pdf_path: str, page_indices: List[int], lang: str = "eng"
+) -> str:
+    """
+    Extract (or OCR) text from the specified pages. Hindi characters
+    remain in the returned string; parsing will strip them line by line.
+    """
     accumulated = ""
     for idx in page_indices:
-        accumulated += extract_page_text(pdf_path, idx, language)
+        accumulated += extract_page_text(pdf_path, idx, lang=lang)
     return accumulated
 
-# ========== HINDI-SPECIFIC FUNCTIONS ==========
-def find_toc_page_indices_hindi(pdf_path: str, max_search_pages: int = 20) -> List[int]:
-    """Find pages with Hindi TOC keywords"""
-    indices: List[int] = []
-    try:
-        reader = PyPDF2.PdfReader(pdf_path)
+
+def extract_text_from_pdf(pdf_path: str, lang: str = "eng") -> str:
+    """
+    Extract (or OCR) text from all pages, concatenated. Hindi remains until parsing.
+    """
+    full_text = ""
+    poppler_path = get_poppler_path()
+    poppler_exists = os.path.exists(os.path.join(poppler_path, "pdftoppm"))
+
+    with open(pdf_path, "rb") as f:
+        reader = PyPDF2.PdfReader(f)
         num_pages = len(reader.pages)
-        search_limit = min(num_pages, max_search_pages)
-        
-        # Hindi TOC keywords
-        toc_keywords = ["विषय सूची", "अनुक्रमणिका", "सूची", "विषय-सूची", "अनुक्रम", "सामग्री"]
 
-        for i in range(search_limit):
-            page_text = extract_page_text(pdf_path, i, "Hindi")
-            # Check for any TOC keyword
-            if any(keyword in page_text for keyword in toc_keywords):
-                indices.append(i)
-                
-        return indices
+        for page_num in range(num_pages):
+            page = reader.pages[page_num]
+            page_text = page.extract_text() or ""
 
-    except Exception as e:
-        st.error(f"Error finding Hindi TOC pages: {e}")
-        return []
+            if not page_text.strip() and poppler_exists:
+                try:
+                    images = convert_from_path(
+                        pdf_path,
+                        first_page=page_num + 1,
+                        last_page=page_num + 1,
+                        poppler_path=poppler_path,
+                        dpi=400,
+                        grayscale=True,
+                    )
+                    if images:
+                        img = images[0]
+                        page_text = pytesseract.image_to_string(
+                            img, lang=lang, config="--psm 6"
+                        )
+                except Exception:
+                    page_text = ""
 
-def extract_toc_hindi(text):
-    """Extract TOC from Hindi text"""
-    toc_start_pattern = r"(विषय[-\s]*सूची|अनुक्रमणिका|सूची|पृष्ठ|अध्याय|अंक|प्रकरण|सामग्री)"
-    match = re.search(toc_start_pattern, text, re.IGNORECASE)
-    if not match:
-        return None
+            full_text += page_text + "\n"
 
-    toc_section = text[match.start():]
-    toc_section = re.sub(r'[^\S\r\n]+', ' ', toc_section)  # Normalize whitespace
-    lines = toc_section.split('\n')
+    return full_text
 
-    toc_entries = []
-    current_title_lines = []
-    digit_pattern = r'[\d०१२३४५६७८९]+$'  # Combined digit pattern
 
-    for line in lines:
-        clean_line = line.strip()
-        if not clean_line:
-            continue
-
-        # Match page number at end of line
-        page_match = re.search(digit_pattern, clean_line)
-        page_number = page_match.group() if page_match else None
-
-        # Handle different cases for TOC line formats
-        if page_number:
-            title_part = clean_line.rsplit(page_number, 1)[0].strip("–-—:. ")
-            
-            # Case 1: Page number with minimal title text + accumulated lines
-            if current_title_lines and len(title_part) < 5:
-                title = ' '.join(current_title_lines).strip()
-                toc_entries.append({
-                    "Title": title,
-                    "Page": normalize_hindi_digits(page_number)
-                })
-                current_title_lines = []
-            
-            # Case 2: Page number with substantial title text
-            else:
-                if current_title_lines:
-                    title = ' '.join(current_title_lines).strip()
-                    toc_entries.append({
-                        "Title": title,
-                        "Page": normalize_hindi_digits(page_number)
-                    })
-                    current_title_lines = []
-                if title_part:
-                    toc_entries.append({
-                        "Title": title_part,
-                        "Page": normalize_hindi_digits(page_number)
-                    })
-        else:
-            # Accumulate lines without page numbers
-            current_title_lines.append(clean_line)
-
-    # Handle any remaining accumulated lines
-    if current_title_lines:
-        title = ' '.join(current_title_lines).strip()
-        if len(title) > 5:
-            toc_entries.append({"Title": title, "Page": "?"})
-
-    # Filter out invalid entries
-    filtered_entries = [
-        entry for entry in toc_entries
-        if len(entry["Title"]) >= 5 and not re.match(r'^\d+$', entry["Title"])
-    ]
-    
-    return filtered_entries
-
-# ========== ENGLISH-SPECIFIC FUNCTIONS ==========
-def find_toc_page_indices_english(pdf_path: str, max_search_pages: int = 20) -> List[int]:
-    indices: List[int] = []
-    try:
-        reader = PyPDF2.PdfReader(pdf_path)
-        num_pages = len(reader.pages)
-        search_limit = min(num_pages, max_search_pages)
-
-        for i in range(search_limit):
-            page_text = extract_page_text(pdf_path, i, "English")
-            lower_all = page_text.lower()
-            
-            # Look for English TOC keywords
-            toc_keywords = ["contents", "table of contents", "toc", "index", "chapters"]
-            if any(keyword in lower_all for keyword in toc_keywords):
-                # Now see if parsing that page yields ≥ 2 valid TOC entries
-                possible_entries = parse_toc_english(page_text)
-                if len(possible_entries) >= 2:
-                    indices.append(i)
-                    # Don't break—TOC can span multiple consecutive pages
-
-        return indices
-
-    except Exception as e:
-        st.error(f"Error finding TOC pages: {e}")
-        return []
-
-def parse_toc_english(text: str) -> List[Dict[str, str]]:
+def parse_toc(text: str) -> List[Dict[str, str]]:
+    """
+    Given a block of text (which may still contain Hindi), parse TOC entries by:
+    - Combining lines that are part of the same entry (multi-line titles)
+    - Stripping Hindi characters from combined entries
+    - Skipping entries that contain header terms (like 'contents', 'page', etc.)
+    - Using regex to capture "Chapter Title ... 12" or "Chapter Title - 12"
+    """
     entries: List[Dict[str, str]] = []
-    skip_terms = ["table of contents", "contents", "page", "toc", "chapter"]
+    skip_terms = ["table of contents", "contents", "page", "toc"]
     current_entry_lines = []  # Collect lines for the current TOC entry
 
     for raw_line in text.split('\n'):
@@ -237,8 +159,7 @@ def parse_toc_english(text: str) -> List[Dict[str, str]]:
         if not line:
             continue
         
-        # Normalize Hindi digits in English documents too
-        cleaned = normalize_hindi_digits(line)
+        cleaned = strip_hindi_chars(line)
         
         # Check if this line ends with a sequence of digits (page number)
         if re.search(r'\d+\s*$', cleaned):
@@ -264,252 +185,283 @@ def parse_toc_english(text: str) -> List[Dict[str, str]]:
             if m:
                 chapter = m.group(1).strip()
                 page_no = m.group(2).strip()
-                entries.append({"Title": chapter, "Page": page_no})
+                entries.append({"chapter": chapter, "page": page_no})
         else:
             # Line doesn't end with page number → buffer it
             current_entry_lines.append(cleaned)
             
     return entries
 
-# ========== UI AND MAIN APP ==========
+
+def find_toc_page_indices(pdf_path: str, max_search_pages: int = 20) -> List[int]:
+    """
+    Look at the first `max_search_pages` pages of the PDF (or fewer if the PDF is shorter).
+    For each page:
+      1. Extract text (via PyPDF2). If blank and poppler exists, do OCR.
+      2. Check the raw text (with both English & Hindi still present) for the substring "contents" (case‐insensitive).
+      3. If "contents" is found, run parse_toc(...) on that raw text. If parse_toc returns ≥ 2 entries, mark this page as TOC.
+    Return a list of all page indices that look like TOC pages.
+    """
+    indices: List[int] = []
+    poppler_path = get_poppler_path()
+    poppler_exists = os.path.exists(os.path.join(poppler_path, "pdftoppm"))
+
+    try:
+        reader = PyPDF2.PdfReader(pdf_path)
+        num_pages = len(reader.pages)
+        search_limit = min(num_pages, max_search_pages)
+
+        for i in range(search_limit):
+            page = reader.pages[i]
+            raw_text = page.extract_text() or ""
+
+            # If PDF text is blank and poppler exists, do a quick page‐OCR
+            if not raw_text.strip() and poppler_exists:
+                try:
+                    images = convert_from_path(
+                        pdf_path,
+                        first_page=i + 1,
+                        last_page=i + 1,
+                        poppler_path=poppler_path,
+                        dpi=300,
+                        grayscale=True,
+                    )
+                    if images:
+                        raw_text = pytesseract.image_to_string(images[0], lang="eng")
+                except Exception:
+                    raw_text = ""
+
+            lower_all = raw_text.lower()
+            # We look for the English word "contents" (case‐insensitive) in the raw text
+            if "contents" in lower_all:
+                # Now see if parsing that page yields ≥ 2 valid TOC entries
+                possible_entries = parse_toc(raw_text)
+                if len(possible_entries) >= 2:
+                    indices.append(i)
+                    # Don’t break—TOC can span multiple consecutive pages
+
+        return indices
+
+    except Exception as e:
+        st.error(f"Error finding TOC pages: {e}")
+        return []
+
+
+# ─── Streamlit UI ──────────────────────────────────────────────────────────────
+
+st.set_page_config(page_title="PDF TOC Extractor", layout="wide")
+st.title("📄 PDF Table of Contents Extractor")
+
+# Initialize session state
+if "extracted" not in st.session_state:
+    st.session_state.extracted = False
+if "editing" not in st.session_state:
+    st.session_state.editing = False
+if "df" not in st.session_state:
+    st.session_state.df = None
+if "pdf_name" not in st.session_state:
+    st.session_state.pdf_name = ""
+if "raw_pdf_bytes" not in st.session_state:
+    st.session_state.raw_pdf_bytes = None
+
+
 def main():
-    st.title("📖 Enhanced Multi-Language PDF TOC Extractor")
-    st.markdown("""
-    Extract Table of Contents from Hindi or English PDFs:
-    - **Hindi**: Uses OCR with image enhancement
-    - **English**: Uses OCR with image enhancement and text extraction
-    - **Raw text** always available regardless of TOC detection
-    - **Enhanced editing** with flexible row/column insertion
-    """)
-    
-    # Language selection
-    st.session_state.language = st.radio(
-        "Select PDF Language:",
-        ["Hindi", "English"],
-        horizontal=True
+    with st.expander("ℹ️ How to use", expanded=True):
+        st.write(
+            """
+        1. **Upload PDF** – Upload any PDF document  
+        2. **Extract TOC** – Click the button to extract the Table of Contents (and include extra pages if desired)  
+        3. **View TOC** – Review the extracted table  
+        4. **Edit TOC** – Click the edit button to make changes  
+        5. **Save Changes** – Save your edits when done  
+        6. **Download** – Export the final TOC as a CSV file (or download an empty template if no TOC was found)  
+        
+        **Large PDF Handling**: For files over 100MB, only the first 70 pages will be processed to improve performance.
+        """
+        )
+
+    # ─── Step 1: Upload PDF ───────────────────────────────────────────────────
+    st.subheader("1. Upload PDF")
+    uploaded_file = st.file_uploader(
+        "Choose a PDF file", type=["pdf"], label_visibility="collapsed"
     )
-    
-    # Configuration
-    with st.expander("Configuration Settings", expanded=False):
+
+    if uploaded_file and st.session_state.raw_pdf_bytes is None:
+        pdf_bytes = uploaded_file.read()
+        st.session_state.raw_pdf_bytes = pdf_bytes
+        st.session_state.pdf_name = uploaded_file.name
+        st.session_state.extracted = False
+        st.success("PDF uploaded successfully!")
+
+    # ─── Step 2: Extract TOC ─────────────────────────────────────────────────
+    if st.session_state.raw_pdf_bytes and not st.session_state.extracted:
+        st.subheader("2. Extract Table of Contents")
+        with st.form("extract_form"):
+            # We force English OCR—Hindi characters will be stripped per-line later
+            st.selectbox("OCR Language", ("eng",), index=0, disabled=True)
+
+            # Allow user to choose how many extra pages (after each detected TOC page) to include, up to 6
+            extra_pages = st.number_input(
+                "Include how many extra pages after each detected TOC page?",
+                min_value=0,
+                max_value=6,
+                value=2,
+                help="If you notice that some TOC entries span into subsequent pages, increase this value.",
+            )
+
+            if st.form_submit_button("🔍 Extract TOC"):
+                with st.spinner("Extracting TOC..."):
+                    # Save uploaded PDF to a temp file
+                    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+                        tmp.write(st.session_state.raw_pdf_bytes)
+                        original_tmp_path = tmp.name
+                    
+                    # Check if PDF is large (>100 MB)
+                    file_size = os.path.getsize(original_tmp_path)
+                    is_large_pdf = file_size > 100 * 1024 * 1024  # 100 MB
+                    
+                    if is_large_pdf:
+                        st.info(f"Large PDF detected ({file_size/(1024*1024):.2f} MB). Using first 70 pages for TOC extraction.")
+                        # Create a new temp file for the truncated version
+                        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as trunc_tmp:
+                            truncated_path = trunc_tmp.name
+                        truncate_pdf(original_tmp_path, truncated_path, max_pages=70)
+                        extraction_path = truncated_path
+                    else:
+                        extraction_path = original_tmp_path
+                    
+                    try:
+                        # 1) Find potential TOC pages among the first 20 pages
+                        toc_indices = find_toc_page_indices(extraction_path, max_search_pages=20)
+
+                        if toc_indices:
+                            # Expand each found index by extra_pages (making sure not to exceed num_pages)
+                            reader = PyPDF2.PdfReader(extraction_path)
+                            num_pages = len(reader.pages)
+
+                            expanded_indices = set()
+                            for i in toc_indices:
+                                for offset in range(0, extra_pages + 1):
+                                    candidate = i + offset
+                                    if candidate < num_pages:
+                                        expanded_indices.add(candidate)
+                            final_indices = sorted(expanded_indices)
+
+                            # 2) Extract text from all expanded TOC pages (OCR if needed)
+                            raw_text = extract_text_from_pages(extraction_path, final_indices, lang="eng")
+
+                        else:
+                            # If none detected, fall back to entire PDF
+                            raw_text = extract_text_from_pdf(extraction_path, lang="eng")
+
+                        # 3) Parse the collected text to extract chapter→page entries
+                        toc_entries = parse_toc(raw_text)
+
+                        if toc_entries:
+                            st.session_state.df = pd.DataFrame(toc_entries)
+                            st.session_state.extracted = True
+                            st.success(f"Extracted {len(toc_entries)} TOC entries")
+                        else:
+                            st.warning("No TOC entries detected.")
+                            # Offer an empty CSV template with columns Page no, Chapter name
+                            empty_df = pd.DataFrame(columns=["Page no", "Chapter name"])
+                            csv_data_empty = empty_df.to_csv(index=False).encode("utf-8")
+                            st.download_button(
+                                label="💾 Download Empty TOC Template (CSV)",
+                                data=csv_data_empty,
+                                file_name="empty_TOC_template.csv",
+                                mime="text/csv",
+                                use_container_width=True,
+                            )
+                    except Exception as e:
+                        st.error(f"Extraction error: {e}")
+                    finally:
+                        # Clean up temporary files
+                        os.unlink(original_tmp_path)
+                        if is_large_pdf:
+                            os.unlink(extraction_path)  # This is the truncated_path
+
+    # ─── Step 3: View TOC ────────────────────────────────────────────────────
+    if st.session_state.extracted and st.session_state.df is not None:
+        st.subheader("3. Extracted Table of Contents")
+        st.dataframe(st.session_state.df, use_container_width=True, height=400)
+        if st.button("✏️ Edit TOC", use_container_width=True):
+            st.session_state.editing = True
+
+    # ─── Step 4: Edit Mode ───────────────────────────────────────────────────
+    if st.session_state.editing and st.session_state.df is not None:
+        st.subheader("4. Edit Table of Contents")
+        edited_df = st.data_editor(
+            st.session_state.df,
+            key="toc_editor",
+            num_rows="dynamic",
+            use_container_width=True,
+            height=400,
+        )
+        
+        # New row insertion functionality
+        st.subheader("Insert New Row")
+        col_insert, col_btn = st.columns([3, 1])
+        with col_insert:
+            # Let user select insertion position (1-indexed)
+            insert_position = st.number_input(
+                "Insert at row number:",
+                min_value=1,
+                max_value=len(edited_df) + 1,
+                value=1,
+                help="Enter the position where you want to insert a new row"
+            )
+        with col_btn:
+            st.write("")  # For vertical alignment
+            if st.button("➕ Insert Empty Row", use_container_width=True):
+                # Create an empty row
+                empty_row = {col: "" for col in edited_df.columns}
+                
+                # Convert to 0-indexed position
+                pos = insert_position - 1
+                
+                # Split the DataFrame and insert the new row
+                top_part = edited_df.iloc[:pos]
+                bottom_part = edited_df.iloc[pos:]
+                
+                # Combine with the new row
+                edited_df = pd.concat(
+                    [top_part, pd.DataFrame([empty_row]), bottom_part],
+                    ignore_index=True
+                )
+                
+                # Update the edited DataFrame
+                st.session_state.df = edited_df
+                st.rerun()  # Refresh to show the new row
+        
         col1, col2 = st.columns(2)
         with col1:
-            st.session_state.poppler_path = st.text_input(
-                "Poppler Path", 
-                value=st.session_state.poppler_path
-            )
+            if st.button("💾 Save Changes", use_container_width=True, type="primary"):
+                st.session_state.df = edited_df
+                st.session_state.editing = False
+                st.success("Changes saved successfully!")
         with col2:
-            st.session_state.tesseract_path = st.text_input(
-                "Tesseract Path", 
-                value=st.session_state.tesseract_path
-            )
-        
-        pytesseract.pytesseract.tesseract_cmd = st.session_state.tesseract_path
-    
-    # Extra pages setting - increased range to 0-20
-    st.session_state.extra_pages = st.slider(
-        "Include extra pages after TOC pages",
-        min_value=0,
-        max_value=20,
-        value=st.session_state.extra_pages,
-        help="TOC might span multiple pages"
-    )
-    
-    # File upload section
-    uploaded_file = st.file_uploader("Upload PDF file", type="pdf")
-    
-    if uploaded_file is not None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            pdf_path = os.path.join(temp_dir, "uploaded.pdf")
-            with open(pdf_path, "wb") as f:
-                f.write(uploaded_file.getbuffer())
-            
-            if st.button("Extract Table of Contents"):
-                with st.spinner("Processing PDF..."):
-                    try:
-                        # Check if PDF is large (>100 MB)
-                        file_size = os.path.getsize(pdf_path)
-                        is_large_pdf = file_size > 100 * 1024 * 1024  # 100 MB
-                        truncated_path = None
-                        
-                        if is_large_pdf:
-                            st.info(f"Large PDF detected ({file_size/(1024*1024):.2f} MB). Using first 70 pages for processing.")
-                            truncated_path = os.path.join(temp_dir, "truncated.pdf")
-                            truncate_pdf(pdf_path, truncated_path, max_pages=70)
-                            extraction_path = truncated_path
-                        else:
-                            extraction_path = pdf_path
-                        
-                        # Language-specific extraction
-                        if st.session_state.language == "Hindi":
-                            # Find TOC pages
-                            toc_indices = find_toc_page_indices_hindi(extraction_path)
-                            
-                            # Expand TOC indices
-                            expanded_indices = set()
-                            for i in toc_indices:
-                                for offset in range(0, st.session_state.extra_pages + 1):
-                                    expanded_indices.add(i + offset)
-                            
-                            # If no TOC found, use first 20 pages
-                            if not expanded_indices:
-                                total_pages = get_total_pages(extraction_path)
-                                expanded_indices = set(range(0, min(20, total_pages)))
-                            
-                            # Extract text from identified pages
-                            extracted_text = extract_text_from_pages(
-                                extraction_path, 
-                                sorted(expanded_indices),
-                                "Hindi"
-                            )
-                            st.session_state.raw_text = extracted_text
-                            
-                            # Attempt TOC extraction
-                            toc_entries = extract_toc_hindi(extracted_text) or []
-                        else:  # English
-                            # Find TOC pages
-                            toc_indices = find_toc_page_indices_english(extraction_path)
-                            
-                            # Expand TOC indices
-                            expanded_indices = set()
-                            for i in toc_indices:
-                                for offset in range(0, st.session_state.extra_pages + 1):
-                                    expanded_indices.add(i + offset)
-                            
-                            # If no TOC found, use first 20 pages
-                            if not expanded_indices:
-                                total_pages = get_total_pages(extraction_path)
-                                expanded_indices = set(range(0, min(20, total_pages)))
-                            
-                            # Extract text from identified pages
-                            extracted_text = extract_text_from_pages(
-                                extraction_path, 
-                                sorted(expanded_indices),
-                                "English"
-                            )
-                            st.session_state.raw_text = extracted_text
-                            
-                            # Attempt TOC extraction
-                            toc_entries = parse_toc_english(extracted_text) or []
-                        
-                        # Process results
-                        if toc_entries:
-                            st.success(f"Successfully extracted {len(toc_entries)} TOC entries!")
-                            st.session_state.toc_df = pd.DataFrame(toc_entries)
-                        else:
-                            st.warning("No TOC found in the document")
-                            st.session_state.toc_df = pd.DataFrame(columns=["Title", "Page"])
-                            
-                        # Show raw text extraction message
-                        st.info(f"Extracted {len(st.session_state.raw_text)} characters of raw text from {len(expanded_indices)} pages")
-                            
-                    except Exception as e:
-                        st.error(f"Error processing PDF: {str(e)}")
-                        st.error("Please check your Poppler and Tesseract paths")
-    
-    # Edit TOC Section
-    if not st.session_state.toc_df.empty:
-        st.subheader("Table of Contents")
-        
-        # Display non-editable preview
-        st.dataframe(st.session_state.toc_df, use_container_width=True)
-        
-        # Edit mode toggle
-        if not st.session_state.edit_mode:
-            if st.button("✏️ Edit TOC"):
-                st.session_state.edit_mode = True
-                st.session_state.backup_df = st.session_state.toc_df.copy()
-                st.experimental_rerun()
-        else:
-            st.subheader("Edit Mode")
-            
-            # Display editable dataframe
-            edited_df = st.data_editor(
-                st.session_state.toc_df,
-                num_rows="dynamic",
-                use_container_width=True,
-                column_config={
-                    "Title": st.column_config.TextColumn("Chapter Title", width="large"),
-                    "Page": st.column_config.TextColumn("Page Number", width="small")
-                }
-            )
-            
-            # Edit controls
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                if st.button("💾 Save Changes"):
-                    st.session_state.toc_df = edited_df
-                    st.session_state.edit_mode = False
-                    st.success("Changes saved!")
-            with col2:
-                if st.button("❌ Discard Changes"):
-                    st.session_state.toc_df = st.session_state.backup_df
-                    st.session_state.edit_mode = False
-                    st.info("Changes discarded")
-            
-            # Advanced editing options
-            with st.expander("🔄 Advanced Editing Tools"):
-                # Row insertion at specific position
-                st.subheader("Insert Row at Specific Position")
-                with st.form("row_insert_form"):
-                    insert_position = st.number_input(
-                        "Row Position (1-based)",
-                        min_value=1,
-                        max_value=len(edited_df)+1,
-                        value=len(edited_df)+1,
-                        help="Position where the new row will be inserted"
-                    )
-                    new_title = st.text_input("Title")
-                    new_page = st.text_input("Page")
-                    
-                    if st.form_submit_button("Insert Row"):
-                        # Create new row as DataFrame
-                        new_row = pd.DataFrame([[new_title, new_page]], columns=["Title", "Page"])
-                        
-                        # Convert 1-based position to 0-based index
-                        pos_index = insert_position - 1
-                        
-                        # Insert row
-                        top_part = edited_df.iloc[:pos_index]
-                        bottom_part = edited_df.iloc[pos_index:]
-                        edited_df = pd.concat([top_part, new_row, bottom_part]).reset_index(drop=True)
-                        st.session_state.toc_df = edited_df
-                        st.success(f"Inserted new row at position {insert_position}")
-                        st.experimental_rerun()
-                
-                # Column insertion
-                st.subheader("Add New Column")
-                with st.form("column_insert_form"):
-                    col_name = st.text_input("Column Name", value=st.session_state.new_col_name)
-                    default_value = st.text_input("Default Value", value=st.session_state.new_col_default)
-                    
-                    if st.form_submit_button("Add Column"):
-                        if col_name in edited_df.columns:
-                            st.error(f"Column '{col_name}' already exists!")
-                        else:
-                            # Add new column with default value
-                            edited_df[col_name] = default_value
-                            st.session_state.toc_df = edited_df
-                            st.session_state.new_col_name = col_name
-                            st.session_state.new_col_default = default_value
-                            st.success(f"Added new column: {col_name}")
-                            st.experimental_rerun()
-    
-    # Raw text section for both languages
-    if 'raw_text' in st.session_state and st.session_state.raw_text:
-        with st.expander("View Raw Extracted Text"):
-            st.text_area("Raw OCR Output", st.session_state.raw_text, height=300)
-            st.info(f"Total characters: {len(st.session_state.raw_text)}")
-    
-    # Download section (always visible if we have data)
-    if not st.session_state.toc_df.empty:
-        st.subheader("Download Final TOC")
-        csv = st.session_state.toc_df.to_csv(index=False).encode('utf-8-sig')
-        st.download_button(
-            label="Download TOC as CSV",
-            data=csv,
-            file_name="table_of_contents.csv",
-            mime="text/csv"
+            if st.button("❌ Cancel Editing", use_container_width=True):
+                st.session_state.editing = False
+
+    # ─── Step 5/6: Download CSV ──────────────────────────────────────────────
+    if st.session_state.extracted and st.session_state.df is not None:
+        st.subheader("5. Download Results")
+        csv_data = st.session_state.df.to_csv(index=False).encode("utf-8")
+        csv_name = (
+            f"{os.path.splitext(st.session_state.pdf_name)[0]}_TOC.csv"
+            if st.session_state.pdf_name
+            else "table_of_contents.csv"
         )
+        st.download_button(
+            label="💾 Download TOC as CSV",
+            data=csv_data,
+            file_name=csv_name,
+            mime="text/csv",
+            use_container_width=True,
+            type="primary",
+        )
+
 
 if __name__ == "__main__":
     main()
